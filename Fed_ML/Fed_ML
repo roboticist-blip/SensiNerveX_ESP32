@@ -1,0 +1,212 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Fed_ML - helper script to build, upload and monitor PlatformIO projects
+# Place this file in the project root and run it (or chmod +x Fed_ML).
+
+cd "$(dirname "$0")"
+
+PIO_CMD=""
+if command -v pio >/dev/null 2>&1; then
+  PIO_CMD=pio
+elif command -v platformio >/dev/null 2>&1; then
+  PIO_CMD=platformio
+else
+  echo "PlatformIO CLI not found. Install 'pio' or 'platformio' and retry."
+  exit 1
+fi
+
+INI_FILE=platformio.ini
+if [ ! -f "$INI_FILE" ]; then
+  echo "platformio.ini not found in $(pwd)"
+  exit 1
+fi
+
+# Collect environment names from platformio.ini
+ENVS=()
+while IFS= read -r line; do
+  if [[ $line =~ ^\[env:([^\]]+)\] ]]; then
+    ENVS+=("${BASH_REMATCH[1]}")
+  fi
+done < "$INI_FILE"
+
+if [ ${#ENVS[@]} -eq 0 ]; then
+  echo "No [env:...] sections found in $INI_FILE"
+  exit 1
+fi
+
+LOG_PREFIX="${FEDML_LOG_PREFIX:-serial_log}"
+TS="$(date +%Y%m%d_%H%M%S)"
+LOG_FILE="${LOG_PREFIX}_${TS}.txt"
+WEIGHTS_FILE="weights_dump_${TS}.txt"
+
+print_help() {
+  cat <<EOF
+Usage: $(basename "$0") [option]
+
+Options:
+  --upload-only, -u     Build and upload for chosen environment
+  --monitor-only, -m    Start monitor for chosen environment (with logging)
+  --dump-weights, -d    Monitor and auto-save NN dump between START/END markers
+  --build-only, -b      Build only
+  --clean               Clean build for chosen environment
+  --list                List detected environments and exit
+  --help, -h            Show this help
+
+If no option is given the script will upload then start monitor with logging.
+Log file pattern:
+  ${LOG_PREFIX}_YYYYMMDD_HHMMSS.txt
+Weight dump file pattern:
+  weights_dump_YYYYMMDD_HHMMSS.txt
+Set custom prefix with env var:
+  FEDML_LOG_PREFIX=mylog ./Fed_ML
+EOF
+}
+
+if [ "${1:-}" = "--help" ] || [ "${1:-}" = "-h" ]; then
+  print_help
+  exit 0
+fi
+
+if [ "${1:-}" = "--list" ]; then
+  echo "Detected environments: ${ENVS[*]}"
+  exit 0
+fi
+
+# Choose environment (if multiple present)
+if [ ${#ENVS[@]} -eq 1 ]; then
+  ENV="${ENVS[0]}"
+else
+  echo "Available environments:"
+  PS3="Select environment (or press Ctrl+C to cancel): "
+  select choice in "${ENVS[@]}"; do
+    if [ -n "$choice" ]; then
+      ENV="$choice"
+      break
+    else
+      echo "Invalid selection."
+    fi
+  done
+fi
+
+ACTION="upload-monitor"
+case "${1:-}" in
+  --upload-only|-u) ACTION="upload" ;;
+  --monitor-only|-m) ACTION="monitor" ;;
+  --dump-weights|-d) ACTION="dump-weights" ;;
+  --build-only|-b) ACTION="build" ;;
+  --clean) ACTION="clean" ;;
+esac
+
+trap 'echo "Interrupted."; exit 130' INT TERM
+
+echo "Using PlatformIO: $PIO_CMD"
+echo "Environment: $ENV"
+
+run_build() {
+  echo "-> Building (env: $ENV)"
+  $PIO_CMD run -e "$ENV"
+}
+
+run_upload() {
+  echo "-> Uploading (env: $ENV)"
+  $PIO_CMD run -e "$ENV" -t upload
+}
+
+run_monitor() {
+  echo "-> Starting monitor (env: $ENV). Press Ctrl+C to stop."
+  echo "-> Logging monitor output to: $LOG_FILE"
+  # Use pio run -t monitor so PlatformIO uses the environment's monitor settings
+  set +e
+  $PIO_CMD run -e "$ENV" -t monitor | tee "$LOG_FILE"
+  local pio_status=${PIPESTATUS[0]}
+  set -e
+  return "$pio_status"
+}
+
+run_dump_weights() {
+  echo "-> Starting monitor (env: $ENV) for weight capture."
+  echo "-> Logging full monitor output to: $LOG_FILE"
+  echo "-> Send 'w' in serial monitor to trigger NN dump."
+  echo "-> Writing extracted hex words to: $WEIGHTS_FILE"
+
+  : > "$WEIGHTS_FILE"
+  set +e
+  $PIO_CMD run -e "$ENV" -t monitor \
+    | tee "$LOG_FILE" \
+    | awk -v out="$WEIGHTS_FILE" '
+      BEGIN { in_dump = 0; saw_start = 0; }
+      /\[NN_DUMP START\]/ { in_dump = 1; saw_start = 1; next }
+      /\[NN_DUMP END\]/ {
+        if (in_dump) {
+          in_dump = 0;
+          exit 0;
+        }
+        next;
+      }
+      {
+        if (!in_dump) next;
+        n = split($0, a, /[^0-9A-Fa-f]+/);
+        for (i = 1; i <= n; i++) {
+          if (length(a[i]) == 8) {
+            print toupper(a[i]) >> out;
+            count++;
+          }
+        }
+        fflush(out);
+      }
+      END {
+        if (!saw_start) {
+          print "[WARN] No [NN_DUMP START] marker seen." > "/dev/stderr";
+          exit 3;
+        }
+        if (count == 0) {
+          print "[WARN] Dump markers seen but no hex words captured." > "/dev/stderr";
+          exit 4;
+        }
+      }
+    '
+  local pio_status=${PIPESTATUS[0]}
+  local awk_status=${PIPESTATUS[2]}
+  set -e
+
+  if [ "$awk_status" -eq 0 ]; then
+    echo "-> Weight dump captured successfully: $WEIGHTS_FILE"
+  else
+    echo "-> Weight dump capture did not complete. Check $LOG_FILE"
+  fi
+
+  # Returning PIO status preserves command behavior consistency.
+  return "$pio_status"
+}
+
+case "$ACTION" in
+  build)
+    run_build
+    ;;
+  upload)
+    run_build
+    run_upload
+    ;;
+  monitor)
+    run_monitor
+    ;;
+  dump-weights)
+    run_dump_weights
+    ;;
+  upload-monitor)
+    run_build
+    run_upload
+    run_monitor
+    ;;
+  clean)
+    echo "-> Cleaning (env: $ENV)"
+    $PIO_CMD run -e "$ENV" -t clean
+    ;;
+  *)
+    echo "Unknown action: $ACTION"
+    exit 2
+    ;;
+esac
+
+exit 0

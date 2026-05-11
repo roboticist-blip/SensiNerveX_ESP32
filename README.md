@@ -33,7 +33,8 @@ The paper's MFCC audio pipeline is replaced by a vibration-angle pipeline: the M
 13. [Validated Test Results (2026-05-03)](#validated-test-results-2026-05-03)
 14. [Extending to Federated Learning](#extending-to-federated-learning)
 15. [Known Limitations & Future Work](#known-limitations--future-work)
-16. [License](#license)
+16. [What's updated in the Latest Version](#What's New in V1.0.1)
+17. [License](#license)
 
 ---
 

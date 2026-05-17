@@ -1,0 +1,345 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Fed_ML — helper script to build, upload, monitor, and manage
+# PlatformIO projects for the SensiNerveX firmware (V2+).
+#
+# V2 additions:
+#   --upload-fs   Upload LittleFS filesystem image (required once per device)
+#   --infer       Monitor filtered to [INFER] lines only
+#   --train       Monitor filtered to [TRAIN] lines only
+#
+# Place this file in the project root and make executable:
+#   chmod +x Fed_ML
+
+cd "$(dirname "$0")"
+
+# ─── Locate PlatformIO CLI ───────────────────────────────────
+PIO_CMD=""
+if command -v pio >/dev/null 2>&1; then
+  PIO_CMD=pio
+elif command -v platformio >/dev/null 2>&1; then
+  PIO_CMD=platformio
+else
+  echo "[ERROR] PlatformIO CLI not found. Install 'pio' or 'platformio' and retry."
+  exit 1
+fi
+
+# ─── Sanity-check project root ───────────────────────────────
+INI_FILE=platformio.ini
+if [ ! -f "$INI_FILE" ]; then
+  echo "[ERROR] platformio.ini not found in $(pwd)"
+  exit 1
+fi
+
+# ─── Collect environment names ───────────────────────────────
+ENVS=()
+while IFS= read -r line; do
+  if [[ $line =~ ^\[env:([^\]]+)\] ]]; then
+    ENVS+=("${BASH_REMATCH[1]}")
+  fi
+done < "$INI_FILE"
+
+if [ ${#ENVS[@]} -eq 0 ]; then
+  echo "[ERROR] No [env:...] sections found in $INI_FILE"
+  exit 1
+fi
+
+# ─── Log / dump file naming ──────────────────────────────────
+LOG_PREFIX="${FEDML_LOG_PREFIX:-serial_log}"
+TS="$(date +%Y%m%d_%H%M%S)"
+LOG_FILE="${LOG_PREFIX}_${TS}.txt"
+WEIGHTS_FILE="weights_dump_${TS}.txt"
+
+# ─── Help text ───────────────────────────────────────────────
+print_help() {
+  cat <<EOF
+Usage: $(basename "$0") [option]
+
+Build & Flash
+  (no option)           Build + upload firmware + open monitor with logging
+  --build-only,  -b     Compile only, no flash
+  --upload-only, -u     Build + flash firmware, no monitor
+  --upload-fs,   -f     Build + upload LittleFS filesystem image
+                          Required once per device before first 's' (save) command.
+                          Does NOT erase firmware. Run after adding:
+                            board_build.filesystem = littlefs
+                          to platformio.ini.
+  --clean               Clean PlatformIO build cache for chosen environment
+
+Monitor
+  (no option)           Full monitor with logging (all serial output)
+  --monitor-only, -m    Full monitor with logging
+  --train,        -T    Monitor filtered to [TRAIN] lines only (+ CMD/SYS/WARN)
+  --infer,        -I    Monitor filtered to [INFER] lines only (+ CMD/SYS/WARN)
+  --dump-weights, -d    Monitor + auto-capture NN weight dump on 'w' command
+
+Utility
+  --list                Print detected PlatformIO environments and exit
+  --help,         -h    Show this help
+
+Log file pattern:
+  \${FEDML_LOG_PREFIX}_YYYYMMDD_HHMMSS.txt      (default prefix: serial_log)
+Weight dump file pattern:
+  weights_dump_YYYYMMDD_HHMMSS.txt
+
+Custom log prefix:
+  FEDML_LOG_PREFIX=run_label2 $(basename "$0") --monitor-only
+
+V2 Serial commands (send in any monitor session):
+  0 / 1 / 2    Set active training label (IDLE / LOW_VIB / HIGH_VIB)
+  t / T        Switch to TRAINING mode
+  i / I        Switch to INFERENCE mode
+  s / S        Save weights to LittleFS  (/snx_model.bin)
+  l / L        Load weights from LittleFS → enter INFERENCE mode
+  w / W        Dump all 8 067 parameters as IEEE-754 hex stream
+EOF
+}
+
+# ─── Early exits ─────────────────────────────────────────────
+if [ "${1:-}" = "--help" ] || [ "${1:-}" = "-h" ]; then
+  print_help; exit 0
+fi
+
+if [ "${1:-}" = "--list" ]; then
+  echo "Detected environments: ${ENVS[*]}"; exit 0
+fi
+
+# ─── Environment selection ───────────────────────────────────
+if [ ${#ENVS[@]} -eq 1 ]; then
+  ENV="${ENVS[0]}"
+else
+  echo "Available environments:"
+  PS3="Select environment (or Ctrl+C to cancel): "
+  select choice in "${ENVS[@]}"; do
+    if [ -n "$choice" ]; then ENV="$choice"; break
+    else echo "Invalid selection."; fi
+  done
+fi
+
+# ─── Action mapping ──────────────────────────────────────────
+ACTION="upload-monitor"
+case "${1:-}" in
+  --upload-only|-u)    ACTION="upload"       ;;
+  --monitor-only|-m)   ACTION="monitor"      ;;
+  --train|-T)          ACTION="train"        ;;
+  --infer|-I)          ACTION="infer"        ;;
+  --dump-weights|-d)   ACTION="dump-weights" ;;
+  --build-only|-b)     ACTION="build"        ;;
+  --upload-fs|-f)      ACTION="upload-fs"    ;;
+  --clean)             ACTION="clean"        ;;
+esac
+
+trap 'echo "Interrupted."; exit 130' INT TERM
+
+echo "PlatformIO : $PIO_CMD"
+echo "Environment: $ENV"
+echo "Action     : $ACTION"
+echo ""
+
+# ─── Core functions ──────────────────────────────────────────
+
+run_build() {
+  echo "-> Building (env: $ENV)"
+  $PIO_CMD run -e "$ENV"
+}
+
+run_upload() {
+  echo "-> Uploading firmware (env: $ENV)"
+  $PIO_CMD run -e "$ENV" -t upload
+}
+
+# run_upload_fs()
+# Uploads the LittleFS filesystem image to the device.
+# This is required once per device before the firmware's 's' (save) command
+# can write /snx_model.bin.  Subsequent firmware uploads do NOT erase the
+# LittleFS partition, so this only needs to be re-run if you reformat flash
+# or change the partition table.
+# Prerequisite: platformio.ini must contain:
+#   board_build.filesystem = littlefs
+run_upload_fs() {
+  echo "-> Uploading LittleFS filesystem image (env: $ENV)"
+  echo "   This initialises the flash partition for model persistence."
+  echo "   Firmware is not touched."
+  $PIO_CMD run -e "$ENV" -t uploadfs
+  echo "-> LittleFS partition ready. You can now use 's' in the serial"
+  echo "   monitor to save trained weights."
+}
+
+run_monitor() {
+  echo "-> Starting full monitor (env: $ENV). Press Ctrl+C to stop."
+  echo "-> Logging to: $LOG_FILE"
+  set +e
+  $PIO_CMD run -e "$ENV" -t monitor | tee "$LOG_FILE"
+  local s=${PIPESTATUS[0]}
+  set -e
+  return "$s"
+}
+
+# run_train_monitor()
+# Opens the serial monitor and filters output to lines relevant to training:
+#   [TRAIN]  — per-window loss and output activations
+#   [CMD]    — label switches and mode changes
+#   [SYS]    — heap/RAM stats printed every 50 steps
+#   [WARN]   — IMU read failures
+#   [NN]     — W2 snapshots printed every 50 steps
+#   [MAIN]   — startup banner and mode announcements
+#   [FATAL]  — hardware errors
+# [ANG] lines (100 per second) are suppressed to reduce noise.
+# Full unfiltered output is still captured in the log file.
+run_train_monitor() {
+  echo "-> Starting TRAINING monitor (env: $ENV). Press Ctrl+C to stop."
+  echo "-> Showing: [TRAIN] [CMD] [SYS] [WARN] [NN] [MAIN] [FATAL]"
+  echo "-> Suppressing: [ANG] (angle printouts)"
+  echo "-> Full log saved to: $LOG_FILE"
+  set +e
+  $PIO_CMD run -e "$ENV" -t monitor \
+    | tee "$LOG_FILE" \
+    | grep --line-buffered -E '^\[(TRAIN|CMD|SYS|WARN|NN|MAIN|FATAL)\]'
+  local s=${PIPESTATUS[0]}
+  set -e
+  return "$s"
+}
+
+# run_infer_monitor()
+# Opens the serial monitor and filters output to lines relevant to inference:
+#   [INFER]  — per-window predicted class and output activations
+#   [CMD]    — mode switches and save/load confirmations
+#   [SYS]    — heap/RAM stats printed every 50 inference steps
+#   [WARN]   — IMU read failures
+#   [MAIN]   — startup banner and mode announcements
+#   [FATAL]  — hardware errors
+# [ANG] and [TRAIN] lines are suppressed.
+# Full unfiltered output is still captured in the log file.
+run_infer_monitor() {
+  echo "-> Starting INFERENCE monitor (env: $ENV). Press Ctrl+C to stop."
+  echo "-> Showing: [INFER] [CMD] [SYS] [WARN] [MAIN] [FATAL]"
+  echo "-> Suppressing: [ANG] [TRAIN]"
+  echo "-> Full log saved to: $LOG_FILE"
+  set +e
+  $PIO_CMD run -e "$ENV" -t monitor \
+    | tee "$LOG_FILE" \
+    | grep --line-buffered -E '^\[(INFER|CMD|SYS|WARN|MAIN|FATAL)\]'
+  local s=${PIPESTATUS[0]}
+  set -e
+  return "$s"
+}
+
+# run_dump_weights()
+# Opens the serial monitor and waits for the firmware to emit a weight dump
+# (triggered by sending 'w' in any other terminal window connected to the
+# same serial port, or from another PIO monitor session).
+# Extracts every 8-character IEEE-754 hex word from between the
+# [NN_DUMP START] and [NN_DUMP END] markers and writes them one per line
+# to weights_dump_YYYYMMDD_HHMMSS.txt.
+# The monitor closes automatically after [NN_DUMP END] is received.
+# Full serial output (including the dump) is also captured in the log file.
+run_dump_weights() {
+  echo "-> Starting monitor (env: $ENV) for weight capture."
+  echo "-> Full log: $LOG_FILE"
+  echo "-> Send 'w' in the serial monitor to trigger the NN dump."
+  echo "-> Extracted hex words will be written to: $WEIGHTS_FILE"
+  : > "$WEIGHTS_FILE"
+  set +e
+  $PIO_CMD run -e "$ENV" -t monitor \
+    | tee "$LOG_FILE" \
+    | awk -v out="$WEIGHTS_FILE" '
+        BEGIN { in_dump = 0; saw_start = 0; count = 0; }
+
+        /\[NN_DUMP START\]/ {
+          in_dump = 1; saw_start = 1; next
+        }
+
+        /\[NN_DUMP END\]/ {
+          if (in_dump) { in_dump = 0; exit 0; }
+          next;
+        }
+
+        {
+          if (!in_dump) next;
+          n = split($0, a, /[^0-9A-Fa-f]+/);
+          for (i = 1; i <= n; i++) {
+            if (length(a[i]) == 8) {
+              print toupper(a[i]) >> out;
+              count++;
+            }
+          }
+          fflush(out);
+        }
+
+        END {
+          if (!saw_start) {
+            print "[WARN] No [NN_DUMP START] marker seen — send w/W to device." \
+              > "/dev/stderr";
+            exit 3;
+          }
+          if (count == 0) {
+            print "[WARN] Dump markers seen but no hex words captured." \
+              > "/dev/stderr";
+            exit 4;
+          }
+          printf "[INFO] %d floats captured to %s\n", count, out > "/dev/stderr";
+        }
+      '
+  local pio_status=${PIPESTATUS[0]}
+  local awk_status=${PIPESTATUS[2]}
+  set -e
+
+  if [ "$awk_status" -eq 0 ]; then
+    echo ""
+    echo "-> Weight dump captured: $WEIGHTS_FILE"
+    echo "   Reconstruct in Python:"
+    echo "     import struct, numpy as np"
+    echo "     words  = open('$WEIGHTS_FILE').read().split()"
+    echo "     floats = [struct.unpack('>f', bytes.fromhex(w))[0] for w in words]"
+    echo "     W1 = np.array(floats[:8000]).reshape(500, 16)"
+    echo "     W2 = np.array(floats[8000:8048]).reshape(16, 3)"
+    echo "     b1 = np.array(floats[8048:8064])"
+    echo "     b2 = np.array(floats[8064:8067])"
+  else
+    echo "-> Weight dump did not complete cleanly. Check $LOG_FILE"
+  fi
+
+  return "$pio_status"
+}
+
+# ─── Action dispatch ─────────────────────────────────────────
+case "$ACTION" in
+  build)
+    run_build
+    ;;
+  upload)
+    run_build
+    run_upload
+    ;;
+  upload-fs)
+    run_upload_fs
+    ;;
+  monitor)
+    run_monitor
+    ;;
+  train)
+    run_train_monitor
+    ;;
+  infer)
+    run_infer_monitor
+    ;;
+  dump-weights)
+    run_dump_weights
+    ;;
+  upload-monitor)
+    run_build
+    run_upload
+    run_monitor
+    ;;
+  clean)
+    echo "-> Cleaning build cache (env: $ENV)"
+    $PIO_CMD run -e "$ENV" -t clean
+    ;;
+  *)
+    echo "[ERROR] Unknown action: $ACTION"
+    exit 2
+    ;;
+esac
+
+exit 0
